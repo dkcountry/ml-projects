@@ -164,4 +164,5 @@ if __name__ == "__main__":
 
     train()
 
+    observation, *_ = env.reset()
     watch_agent(env, q_network, "../tetris.mp4")
