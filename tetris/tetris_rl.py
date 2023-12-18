@@ -14,37 +14,39 @@ from stable_baselines3.common.atari_wrappers import (
     NoopResetEnv,
 )
 from torch.utils.tensorboard import SummaryWriter
+import imageio
 
 
+# Parameters
 SEED = 42069
 device = torch.device("mps")
-learning_rate = 1e-3
+learning_rate = 1e-4
 batch_size = 32
 start_e = 1
 end_e = .01
 exploration_fraction = 0.1
 tau = 1.0
 gamma = .99
-buffer_size = 1000
-total_timesteps = 10000
-learning_starts = 700
+buffer_size = 10000
+total_timesteps = 100000
+learning_starts = 7000
 target_network_frequency = 100
 train_frequency = 4
 
-writer = SummaryWriter('../tetris/runs')
 
-env = gym.make("ALE/Tetris-v5", render_mode="rgb_array")
-env = NoopResetEnv(env, noop_max=15)
-env = MaxAndSkipEnv(env, skip=4)
-env = EpisodicLifeEnv(env)
-env = ClipRewardEnv(env)
-env = gym.wrappers.ResizeObservation(env, (84, 84))
-env = gym.wrappers.GrayScaleObservation(env)
-env = gym.wrappers.FrameStack(env, 4)
-env = gym.wrappers.RecordVideo(env, "../tetris")
-env.action_space.seed(SEED)
-
-obs, _ = env.reset(seed=SEED)
+def create_env(env_id="ALE/Tetris-v5", record_video=False):
+    env = gym.make(env_id, render_mode="rgb_array")
+    env = NoopResetEnv(env, noop_max=15)
+    env = MaxAndSkipEnv(env, skip=4)
+    env = EpisodicLifeEnv(env)
+    env = ClipRewardEnv(env)
+    env = gym.wrappers.ResizeObservation(env, (84, 84))
+    env = gym.wrappers.GrayScaleObservation(env)
+    env = gym.wrappers.FrameStack(env, 4)
+    if record_video:
+        env = gym.wrappers.RecordVideo(env, "../tetris")
+    env.action_space.seed(SEED)
+    return env
 
 
 class QNetwork(nn.Module):
@@ -72,19 +74,6 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     return max(slope * t + start_e, end_e)
 
 
-q_network = QNetwork(env).to(device)
-optimizer = optim.Adam(q_network.parameters(), lr=learning_rate)
-target_network = QNetwork(env).to(device)
-target_network.load_state_dict(q_network.state_dict())
-
-rb = ReplayBuffer(
-    buffer_size,
-    env.observation_space,
-    env.action_space,
-    device
-)
-
-
 def generate_experience(observation, global_step):
     epsilon = linear_schedule(start_e, end_e, exploration_fraction * total_timesteps, global_step)
     if random.random() < epsilon:
@@ -94,8 +83,8 @@ def generate_experience(observation, global_step):
         action = torch.argmax(q_values, dim=1).cpu().numpy()[0]
 
     next_obs, reward, terminated, truncated, info = env.step(action)
-    done = terminated or truncated
     next_observation = torch.tensor(next_obs, dtype=torch.float32).unsqueeze(0)
+    done = terminated or truncated
     rb.add(observation, next_observation, action, reward, done, [info])
 
     if terminated or truncated:
@@ -108,7 +97,7 @@ def generate_experience(observation, global_step):
     return next_observation, reward, terminated, truncated, info, action
 
 
-def train(update_target_network=False, global_step=0):
+def train_loop(update_target_network=False, global_step=0):
     data = rb.sample(batch_size)
     with torch.no_grad():
         target_max, _ = target_network(data.next_observations).max(dim=1)
@@ -125,15 +114,54 @@ def train(update_target_network=False, global_step=0):
             target_network_param.data.copy_(tau * q_network_param.data + (1.0 - tau) * target_network_param.data)
 
 
-env.reset(seed=SEED)
-next_obs, *_ = env.step(4)
-observation = torch.tensor(next_obs, dtype=torch.float32).unsqueeze(0)
+def train():
+    observation, *_ = env.reset()
+    observation = torch.tensor(observation, dtype=torch.float32).unsqueeze(0)
+    for global_step in tqdm(range(total_timesteps)):
+        observation, reward, terminated, truncated, info, action = generate_experience(observation, global_step)
+        if global_step > learning_starts:
+            if global_step % train_frequency == 0:
+                if global_step % target_network_frequency == 0:
+                    train_loop(update_target_network=True, global_step=global_step)
+                else:
+                    train_loop(update_target_network=False, global_step=global_step)
 
-for global_step in tqdm(range(total_timesteps)):
-    observation, reward, terminated, truncated, info, action = generate_experience(observation, global_step)
-    if global_step > learning_starts:
-        if global_step % train_frequency == 0:
-            if global_step % target_network_frequency == 0:
-                train(update_target_network=True, global_step=global_step)
-            else:
-                train(update_target_network=False, global_step=global_step)
+
+def watch_agent(env, q_network, out_directory, fps=20):
+    observation, *_ = env.reset()
+    observation = torch.tensor(observation, dtype=torch.float32).unsqueeze(0)
+    images = []
+    done = False
+    while not done:
+        img = env.render()
+        images.append(img)
+        q_values = q_network(torch.Tensor(observation).to(device))
+        action = torch.argmax(q_values, dim=1).cpu().numpy()[0]
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        observation = torch.tensor(next_obs, dtype=torch.float32).unsqueeze(0)
+        done = terminated or truncated
+
+    print("Frames survived:", info["episode_frame_number"])
+    env.close()
+    imageio.mimsave(out_directory, [np.array(img) for i, img in enumerate(images)], fps=fps)
+
+
+if __name__ == "__main__":
+    writer = SummaryWriter('../tetris/runs')
+
+    env = create_env()
+    q_network = QNetwork(env).to(device)
+    optimizer = optim.Adam(q_network.parameters(), lr=learning_rate)
+    target_network = QNetwork(env).to(device)
+    target_network.load_state_dict(q_network.state_dict())
+
+    rb = ReplayBuffer(
+        buffer_size,
+        env.observation_space,
+        env.action_space,
+        device
+    )
+
+    train()
+
+    watch_agent(env, q_network, "../tetris.mp4")
