@@ -27,11 +27,12 @@ end_e = .01
 exploration_fraction = 0.1
 tau = 1.0
 gamma = .99
-buffer_size = 10000
-total_timesteps = 100000
-learning_starts = 7000
+buffer_size = 50000
+total_timesteps = 2000000
+learning_starts = 30000
 target_network_frequency = 100
 train_frequency = 4
+dropout = 0.2
 
 
 def create_env(env_id="ALE/Tetris-v5", record_video=False):
@@ -50,6 +51,7 @@ def create_env(env_id="ALE/Tetris-v5", record_video=False):
 
 
 class QNetwork(nn.Module):
+    """Basic Q Net"""
     def __init__(self, env):
         super().__init__()
         self.network = nn.Sequential(
@@ -67,6 +69,58 @@ class QNetwork(nn.Module):
 
     def forward(self, x):
         return self.network(x / 255.0)
+
+
+class ComplexNetwork(nn.Module):
+    """Experiment with a more complex architecture + dropout"""
+    def __init__(self, env):
+        super().__init__()
+        self.pixel_net = nn.Sequential(
+            nn.Conv2d(4, 32, 8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        self.attr_net = nn.Sequential(
+            nn.Conv2d(4, 32, 8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(3136, 512),
+            nn.ReLU(),
+            nn.Linear(512, 6),
+            nn.Dropout(dropout)
+        )
+        self.attr_net_two = nn.Sequential(
+            nn.Conv2d(4, 32, 8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(3136, 512),
+            nn.ReLU(),
+            nn.Linear(512, 6),
+            nn.Dropout(dropout)
+        )
+        self.out_net = nn.Sequential(
+            nn.Linear(3148, 512),
+            nn.ReLU(),
+            nn.Linear(512, env.action_space.n),
+        )
+
+    def forward(self, x):
+        a = self.pixel_net(x / 255.0)
+        b = self.attr_net(x / 255.0)
+        c = self.attr_net_two(x / 255.0)
+        return self.out_net(torch.cat([a, b, c], dim=1))
 
 
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
@@ -114,10 +168,10 @@ def train_loop(update_target_network=False, global_step=0):
             target_network_param.data.copy_(tau * q_network_param.data + (1.0 - tau) * target_network_param.data)
 
 
-def train():
+def train(start_step=0, end_step=total_timesteps):
     observation, *_ = env.reset()
     observation = torch.tensor(observation, dtype=torch.float32).unsqueeze(0)
-    for global_step in tqdm(range(total_timesteps)):
+    for global_step in tqdm(range(start_step, end_step)):
         observation, reward, terminated, truncated, info, action = generate_experience(observation, global_step)
         if global_step > learning_starts:
             if global_step % train_frequency == 0:
@@ -135,8 +189,13 @@ def watch_agent(env, q_network, out_directory, fps=20):
     while not done:
         img = env.render()
         images.append(img)
-        q_values = q_network(torch.Tensor(observation).to(device))
-        action = torch.argmax(q_values, dim=1).cpu().numpy()[0]
+
+        if random.random() < end_e:
+            action = env.action_space.sample()
+        else:
+            q_values = q_network(torch.Tensor(observation).to(device))
+            action = torch.argmax(q_values, dim=1).cpu().numpy()[0]
+
         next_obs, reward, terminated, truncated, info = env.step(action)
         observation = torch.tensor(next_obs, dtype=torch.float32).unsqueeze(0)
         done = terminated or truncated
@@ -150,9 +209,9 @@ if __name__ == "__main__":
     writer = SummaryWriter('../tetris/runs')
 
     env = create_env()
-    q_network = QNetwork(env).to(device)
+    q_network = ComplexNetwork(env).to(device)
     optimizer = optim.Adam(q_network.parameters(), lr=learning_rate)
-    target_network = QNetwork(env).to(device)
+    target_network = ComplexNetwork(env).to(device)
     target_network.load_state_dict(q_network.state_dict())
 
     rb = ReplayBuffer(
@@ -166,3 +225,7 @@ if __name__ == "__main__":
 
     observation, *_ = env.reset()
     watch_agent(env, q_network, "../tetris.mp4")
+
+    model_path = f"../tetris/runs/{'test'}/{'test'}.model"
+    torch.save(q_network.state_dict(), model_path)
+    print(f"model saved to {model_path}")
