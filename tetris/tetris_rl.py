@@ -28,8 +28,8 @@ exploration_fraction = 0.1
 tau = 1.0
 gamma = .99
 buffer_size = 50000
-total_timesteps = 2000000
-learning_starts = 30000
+total_timesteps = 3000000
+learning_starts = 50000
 target_network_frequency = 100
 train_frequency = 4
 dropout = 0.2
@@ -50,25 +50,15 @@ def create_env(env_id="ALE/Tetris-v5", record_video=False):
     return env
 
 
-class QNetwork(nn.Module):
-    """Basic Q Net"""
-    def __init__(self, env):
-        super().__init__()
-        self.network = nn.Sequential(
-            nn.Conv2d(4, 32, 8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(3136, 512),
-            nn.ReLU(),
-            nn.Linear(512, env.action_space.n),
-        )
+class GlobalReward:
+    def __init__(self):
+        self.value = 0.0
 
-    def forward(self, x):
-        return self.network(x / 255.0)
+    def add(self, new_reward):
+        self.value += new_reward
+
+    def reset(self):
+        self.value = 0.0
 
 
 class ComplexNetwork(nn.Module):
@@ -83,6 +73,7 @@ class ComplexNetwork(nn.Module):
             nn.Conv2d(64, 64, 3, stride=1),
             nn.ReLU(),
             nn.Flatten(),
+            nn.Dropout(dropout)
         )
         self.attr_net = nn.Sequential(
             nn.Conv2d(4, 32, 8, stride=4),
@@ -128,6 +119,18 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     return max(slope * t + start_e, end_e)
 
 
+def perform_action(action):
+    next_obs, reward, terminated, truncated, info = env.step(action)
+    # skip every other frame if possible
+    reward_two = 0.0
+    if not terminated or truncated:
+        next_obs, reward_two, terminated, truncated, info = env.step(0)
+    # collapse rewards from both frames
+    reward = reward + reward_two
+    observation = torch.tensor(next_obs, dtype=torch.float32).unsqueeze(0)
+    return observation, reward, terminated, truncated, info
+
+
 def generate_experience(observation, global_step):
     epsilon = linear_schedule(start_e, end_e, exploration_fraction * total_timesteps, global_step)
     if random.random() < epsilon:
@@ -136,17 +139,17 @@ def generate_experience(observation, global_step):
         q_values = q_network(torch.Tensor(observation).to(device))
         action = torch.argmax(q_values, dim=1).cpu().numpy()[0]
 
-    next_obs, reward, terminated, truncated, info = env.step(action)
-    next_observation = torch.tensor(next_obs, dtype=torch.float32).unsqueeze(0)
+    next_observation, reward, terminated, truncated, info = perform_action(action)
     done = terminated or truncated
     rb.add(observation, next_observation, action, reward, done, [info])
+    global_reward.add(reward)
 
-    if terminated or truncated:
-        print(info)
-        writer.add_scalar("charts/episode_score", info["episode_frame_number"], global_step)
-        env.reset(seed=SEED)
-        next_obs, reward, terminated, truncated, info = env.step(action)
-        next_observation = torch.tensor(next_obs, dtype=torch.float32).unsqueeze(0)
+    if done:
+        writer.add_scalar("charts/episode_length", info["episode_frame_number"], global_step)
+        writer.add_scalar("charts/episode_reward", global_reward.value, global_step)
+        env.reset()
+        global_reward.reset()
+        next_observation, reward, terminated, truncated, info = perform_action(action)
 
     return next_observation, reward, terminated, truncated, info, action
 
@@ -196,11 +199,11 @@ def watch_agent(env, q_network, out_directory, fps=20):
             q_values = q_network(torch.Tensor(observation).to(device))
             action = torch.argmax(q_values, dim=1).cpu().numpy()[0]
 
-        next_obs, reward, terminated, truncated, info = env.step(action)
-        observation = torch.tensor(next_obs, dtype=torch.float32).unsqueeze(0)
+        next_observation, reward, terminated, truncated, info = perform_action(action)
         done = terminated or truncated
 
     print("Frames survived:", info["episode_frame_number"])
+    print("Reward:", global_reward.value)
     env.close()
     imageio.mimsave(out_directory, [np.array(img) for i, img in enumerate(images)], fps=fps)
 
@@ -221,11 +224,11 @@ if __name__ == "__main__":
         device
     )
 
+    global_reward = GlobalReward()
     train()
 
-    observation, *_ = env.reset()
     watch_agent(env, q_network, "../tetris.mp4")
 
-    model_path = f"../tetris/runs/{'test'}/{'test'}.model"
+    model_path = f"../tetris/{'tetris_v2'}.model"
     torch.save(q_network.state_dict(), model_path)
     print(f"model saved to {model_path}")
