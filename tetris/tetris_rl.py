@@ -184,8 +184,9 @@ def train(start_step=0, end_step=total_timesteps):
                     train_loop(update_target_network=False, global_step=global_step)
 
 
-def watch_agent(env, q_network, out_directory, fps=20):
+def watch_agent(env, q_network, out_directory, fps=15):
     observation, *_ = env.reset()
+    global_reward.reset()
     observation = torch.tensor(observation, dtype=torch.float32).unsqueeze(0)
     images = []
     done = False
@@ -200,6 +201,7 @@ def watch_agent(env, q_network, out_directory, fps=20):
             action = torch.argmax(q_values, dim=1).cpu().numpy()[0]
 
         next_observation, reward, terminated, truncated, info = perform_action(action)
+        global_reward.add(reward)
         done = terminated or truncated
 
     print("Frames survived:", info["episode_frame_number"])
