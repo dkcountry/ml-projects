@@ -15,6 +15,7 @@ from stable_baselines3.common.atari_wrappers import (
 )
 from torch.utils.tensorboard import SummaryWriter
 import imageio
+from gymnasium.spaces import Box
 
 
 # Parameters
@@ -27,23 +28,48 @@ end_e = .01
 exploration_fraction = 0.1
 tau = 1.0
 gamma = .99
-buffer_size = 50000
-total_timesteps = 3000000
-learning_starts = 50000
+buffer_size = 5000
+total_timesteps = 100000
+learning_starts = 5000
 target_network_frequency = 100
 train_frequency = 4
 dropout = 0.2
 
 
+class ScaledFloatFrame(gym.ObservationWrapper):
+    """Normalize pixel values in frame --> 0 to 1"""
+    def observation(self, obs):
+        if len(obs) == 2:
+            return np.array(obs[0]).astype(np.float32) / 255.0, obs[1]
+        else:
+            return np.array(obs).astype(np.float32) / 255.0
+
+
+class CondenseFrame(gym.ObservationWrapper):
+    """isolate obs space to just tetris board"""
+    def observation(self, obs, x_start=13, x_stop=33, y_start=11, y_stop=81):
+        frame = obs[0] if len(obs) == 2 else obs
+        condensed_frame = np.ndarray([y_stop - y_start, x_stop - x_start])
+        for i in range(y_start, y_stop):
+            row = frame[i][x_start:x_stop]
+            condensed_frame[i - y_start] = row
+        condensed_frame = condensed_frame.reshape(10, 2, 70)
+        if len(obs) == 2:
+            return condensed_frame, obs[1]
+        else:
+            return condensed_frame
+
+
 def create_env(env_id="ALE/Tetris-v5", record_video=False):
     env = gym.make(env_id, render_mode="rgb_array")
-    env = NoopResetEnv(env, noop_max=15)
-    env = MaxAndSkipEnv(env, skip=4)
+    env = NoopResetEnv(env, noop_max=10)
+    env = MaxAndSkipEnv(env, skip=2)
     env = EpisodicLifeEnv(env)
     env = ClipRewardEnv(env)
     env = gym.wrappers.ResizeObservation(env, (84, 84))
     env = gym.wrappers.GrayScaleObservation(env)
-    env = gym.wrappers.FrameStack(env, 4)
+    env = ScaledFloatFrame(env)
+    env = CondenseFrame(env)
     if record_video:
         env = gym.wrappers.RecordVideo(env, "../tetris")
     env.action_space.seed(SEED)
@@ -61,74 +87,43 @@ class GlobalReward:
         self.value = 0.0
 
 
-class ComplexNetwork(nn.Module):
+class QNet(nn.Module):
     """Experiment with a more complex architecture + dropout"""
     def __init__(self, env):
         super().__init__()
-        self.pixel_net = nn.Sequential(
-            nn.Conv2d(4, 32, 8, stride=4),
+        self.column_net = nn.Sequential(
+            nn.Conv2d(1, 20, 2, stride=2),
             nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=1),
+            nn.Conv2d(20, 40, (1, 4), stride=4),
             nn.ReLU(),
             nn.Flatten(),
-            nn.Dropout(dropout)
         )
-        self.attr_net = nn.Sequential(
-            nn.Conv2d(4, 32, 8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(3136, 512),
-            nn.ReLU(),
-            nn.Linear(512, 6),
-            nn.Dropout(dropout)
-        )
-        self.attr_net_two = nn.Sequential(
-            nn.Conv2d(4, 32, 8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(3136, 512),
-            nn.ReLU(),
-            nn.Linear(512, 6),
-            nn.Dropout(dropout)
-        )
+
         self.out_net = nn.Sequential(
-            nn.Linear(3148, 512),
+            nn.Linear(3200, 512),
             nn.ReLU(),
             nn.Linear(512, env.action_space.n),
         )
 
     def forward(self, x):
-        a = self.pixel_net(x / 255.0)
-        b = self.attr_net(x / 255.0)
-        c = self.attr_net_two(x / 255.0)
-        return self.out_net(torch.cat([a, b, c], dim=1))
+        x = torch.tensor(x, dtype=torch.float32)
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
+        batch_size = x.size(0)
+        extracted_tensors = []
+        for i in range(x.size(1)):
+            extracted_tensor = x[:, i:i + 1, :, :]
+            extracted_tensors.append(extracted_tensor)
+
+        conv_cols = [self.column_net(col) for col in extracted_tensors]
+        conv_concat = torch.cat(conv_cols, dim=0)
+        x_out = conv_concat.view(batch_size, 3200)
+        return self.out_net(x_out)
 
 
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     slope = (end_e - start_e) / duration
     return max(slope * t + start_e, end_e)
-
-
-def perform_action(action):
-    next_obs, reward, terminated, truncated, info = env.step(action)
-    # skip every other frame if possible
-    reward_two = 0.0
-    if not terminated or truncated:
-        next_obs, reward_two, terminated, truncated, info = env.step(0)
-    # collapse rewards from both frames
-    reward = reward + reward_two
-    observation = torch.tensor(next_obs, dtype=torch.float32).unsqueeze(0)
-    return observation, reward, terminated, truncated, info
 
 
 def generate_experience(observation, global_step):
@@ -139,7 +134,7 @@ def generate_experience(observation, global_step):
         q_values = q_network(torch.Tensor(observation).to(device))
         action = torch.argmax(q_values, dim=1).cpu().numpy()[0]
 
-    next_observation, reward, terminated, truncated, info = perform_action(action)
+    next_observation, reward, terminated, truncated, info = env.step(action)
     done = terminated or truncated
     rb.add(observation, next_observation, action, reward, done, [info])
     global_reward.add(reward)
@@ -149,7 +144,7 @@ def generate_experience(observation, global_step):
         writer.add_scalar("charts/episode_reward", global_reward.value, global_step)
         env.reset()
         global_reward.reset()
-        next_observation, reward, terminated, truncated, info = perform_action(action)
+        next_observation, reward, terminated, truncated, info = env.step(action)
 
     return next_observation, reward, terminated, truncated, info, action
 
@@ -200,7 +195,7 @@ def watch_agent(env, q_network, out_directory, fps=15):
             q_values = q_network(torch.Tensor(observation).to(device))
             action = torch.argmax(q_values, dim=1).cpu().numpy()[0]
 
-        next_observation, reward, terminated, truncated, info = perform_action(action)
+        next_observation, reward, terminated, truncated, info = env.step(action)
         global_reward.add(reward)
         done = terminated or truncated
 
@@ -214,14 +209,14 @@ if __name__ == "__main__":
     writer = SummaryWriter('../tetris/runs')
 
     env = create_env()
-    q_network = ComplexNetwork(env).to(device)
+    q_network = QNet(env).to(device)
     optimizer = optim.Adam(q_network.parameters(), lr=learning_rate)
-    target_network = ComplexNetwork(env).to(device)
+    target_network = QNet(env).to(device)
     target_network.load_state_dict(q_network.state_dict())
 
     rb = ReplayBuffer(
         buffer_size,
-        env.observation_space,
+        Box(low=0, high=255, shape=(10, 2, 70), dtype=np.uint8),
         env.action_space,
         device
     )
@@ -231,6 +226,68 @@ if __name__ == "__main__":
 
     watch_agent(env, q_network, "../tetris.mp4")
 
-    model_path = f"../tetris/{'tetris_v2'}.model"
+    model_path = f"../tetris/{'tetris'}.model"
     torch.save(q_network.state_dict(), model_path)
     print(f"model saved to {model_path}")
+
+
+q_network.load_state_dict(torch.load(model_path))
+
+
+class Net(nn.Module):
+    """Experiment with a more complex architecture + dropout"""
+    def __init__(self, env):
+        super().__init__()
+        self.column_net = nn.Sequential(
+            nn.Conv2d(1, 20, 2, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(20, 20, (1, 4), stride=4),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
+        self.out_net = nn.Sequential(
+            nn.Linear(1600, 512),
+            nn.ReLU(),
+            nn.Linear(512, env.action_space.n),
+        )
+
+    def forward(self, x):
+        x_reshaped = x.reshape(10, 2, 70)
+        cols = [torch.tensor(col, dtype=torch.float32).unsqueeze(0) for col in x_reshaped]
+        conv_cols = [self.column_net(col) for col in cols]
+        conv_concat = torch.cat(conv_cols, dim=0)
+        return self.out_net(conv_concat.view(1, 1600))
+
+
+
+x_start = 13
+x_stop = 33
+y_start = 11
+y_stop = 81
+
+img = np.ndarray([y_stop - y_start, x_stop - x_start])
+
+for i in range(y_start, y_stop):
+    row = observation[i][x_start:x_stop]
+    img[i-y_start] = row
+
+
+from PIL import Image
+import numpy as np
+image_RGB = img
+image = Image.fromarray(image_RGB.astype('uint8'))
+image.save('../image.jpg')
+
+q_network.pixel_net(torch.tensor(img[0], dtype=torch.float32))
+
+q_network = Net()
+
+a = torch.tensor(img[0], dtype=torch.float32).unsqueeze(-1).T
+a = a.unsqueeze(1)
+
+b = q_network.pixel_net(a)
+
+imageio.mimsave("../tetris.png", [np.array(img) for i in img])
+
+reshaped_array = x_T.reshape(10, 2, 70)
