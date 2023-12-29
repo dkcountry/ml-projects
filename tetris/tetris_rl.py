@@ -28,9 +28,9 @@ end_e = .01
 exploration_fraction = 0.1
 tau = 1.0
 gamma = .99
-buffer_size = 5000
-total_timesteps = 100000
-learning_starts = 5000
+buffer_size = 50000
+total_timesteps = 1000000
+learning_starts = 50000
 target_network_frequency = 100
 train_frequency = 4
 dropout = 0.2
@@ -97,12 +97,14 @@ class QNet(nn.Module):
             nn.Conv2d(20, 40, (1, 4), stride=4),
             nn.ReLU(),
             nn.Flatten(),
+            nn.Dropout(dropout)
         )
 
         self.out_net = nn.Sequential(
             nn.Linear(3200, 512),
             nn.ReLU(),
             nn.Linear(512, env.action_space.n),
+            nn.Dropout(dropout)
         )
 
     def forward(self, x):
@@ -234,30 +236,13 @@ if __name__ == "__main__":
 q_network.load_state_dict(torch.load(model_path))
 
 
-class Net(nn.Module):
-    """Experiment with a more complex architecture + dropout"""
-    def __init__(self, env):
-        super().__init__()
-        self.column_net = nn.Sequential(
-            nn.Conv2d(1, 20, 2, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(20, 20, (1, 4), stride=4),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
 
-        self.out_net = nn.Sequential(
-            nn.Linear(1600, 512),
-            nn.ReLU(),
-            nn.Linear(512, env.action_space.n),
-        )
 
-    def forward(self, x):
-        x_reshaped = x.reshape(10, 2, 70)
-        cols = [torch.tensor(col, dtype=torch.float32).unsqueeze(0) for col in x_reshaped]
-        conv_cols = [self.column_net(col) for col in cols]
-        conv_concat = torch.cat(conv_cols, dim=0)
-        return self.out_net(conv_concat.view(1, 1600))
+
+
+
+
+
 
 
 
