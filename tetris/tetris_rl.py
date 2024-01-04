@@ -28,21 +28,22 @@ end_e = .01
 exploration_fraction = 0.1
 tau = 1.0
 gamma = .99
-buffer_size = 50000
-total_timesteps = 1000000
-learning_starts = 50000
+buffer_size = 5000
+total_timesteps = 100000
+learning_starts = 5000
 target_network_frequency = 100
 train_frequency = 4
 dropout = 0.2
+ROW_INDICES = {i for i in range(70)}
 
 
-class ScaledFloatFrame(gym.ObservationWrapper):
-    """Normalize pixel values in frame --> 0 to 1"""
+class ScaledBoolFrame(gym.ObservationWrapper):
+    """Normalize pixel values in frame to 0s and 1s"""
     def observation(self, obs):
-        if len(obs) == 2:
-            return np.array(obs[0]).astype(np.float32) / 255.0, obs[1]
-        else:
-            return np.array(obs).astype(np.float32) / 255.0
+        obs_out = obs[0] if len(obs) == 2 else obs
+        obs_out[obs_out == 111] = 0
+        obs_out[obs_out != 0] = 1
+        return (obs_out, obs[1]) if len(obs) == 2 else obs_out
 
 
 class CondenseFrame(gym.ObservationWrapper):
@@ -53,7 +54,6 @@ class CondenseFrame(gym.ObservationWrapper):
         for i in range(y_start, y_stop):
             row = frame[i][x_start:x_stop]
             condensed_frame[i - y_start] = row
-        condensed_frame = condensed_frame.reshape(10, 2, 70)
         if len(obs) == 2:
             return condensed_frame, obs[1]
         else:
@@ -63,28 +63,85 @@ class CondenseFrame(gym.ObservationWrapper):
 def create_env(env_id="ALE/Tetris-v5", record_video=False):
     env = gym.make(env_id, render_mode="rgb_array")
     env = NoopResetEnv(env, noop_max=10)
-    env = MaxAndSkipEnv(env, skip=2)
+    env = MaxAndSkipEnv(env, skip=3)
     env = EpisodicLifeEnv(env)
     env = ClipRewardEnv(env)
     env = gym.wrappers.ResizeObservation(env, (84, 84))
     env = gym.wrappers.GrayScaleObservation(env)
-    env = ScaledFloatFrame(env)
+    env = ScaledBoolFrame(env)
     env = CondenseFrame(env)
+    env = gym.wrappers.FrameStack(env, 3)
     if record_video:
         env = gym.wrappers.RecordVideo(env, "../tetris")
     env.action_space.seed(SEED)
     return env
 
 
-class GlobalReward:
+class GlobalRewardTracker:
     def __init__(self):
         self.value = 0.0
+        self.fitness = 0.0
 
     def add(self, new_reward):
         self.value += new_reward
 
+    def update_fitness(self, fitness):
+        self.fitness = fitness
+
     def reset(self):
         self.value = 0.0
+        self.fitness = 0.0
+
+
+def censor_moving_piece(obs_new, obs_old):
+    obs_out = obs_new
+    diff = obs_new - obs_old
+    nonzeros = diff.nonzero()
+    if len(nonzeros[0]) != 0:
+        obs_out[nonzeros[0].min():nonzeros[0].max()+1, nonzeros[1].min():nonzeros[1].max()+1] = 0.
+
+    obs_nonzeros = obs_new.nonzero()
+    set_diff = ROW_INDICES - set(obs_nonzeros[0])
+    if len(set_diff) != 0:
+        obs_out[0:max(set_diff)+1, 0: len(obs_out[0])] = 0.
+
+    return obs_out
+
+
+def reward_fitness_func(obs, game_reward, prev_fitness):
+    if game_reward == 1:
+        return game_reward, prev_fitness
+
+    img = (obs * 255).astype(int).T
+    aggregate_height, bumpiness = board_stats(img)
+
+    curr_fitness = -aggregate_height / 1400 - bumpiness / 2660
+    return curr_fitness - prev_fitness, curr_fitness
+
+
+def col_height(col):
+    col = col[::-1]
+    for i in range(len(col) - 3):
+        if col[i] == 111 and col[i + 1] == 111 and col[i + 2] == 111 and col[i + 3] == 111:
+            return i
+
+    return len(col)
+
+
+def board_stats(img):
+    aggregate_height = 0
+    bumpiness = 0
+    prev_col_height = 0
+
+    for i in range(len(img)):
+        height = col_height(img[i])
+        aggregate_height += height
+        if i > 0:
+            height_diff = np.abs(height - prev_col_height)
+            bumpiness += height_diff
+        prev_col_height = height
+
+    return aggregate_height, bumpiness
 
 
 class QNet(nn.Module):
@@ -94,7 +151,7 @@ class QNet(nn.Module):
         self.column_net = nn.Sequential(
             nn.Conv2d(1, 20, 2, stride=2),
             nn.ReLU(),
-            nn.Conv2d(20, 40, (1, 4), stride=4),
+            nn.Conv2d(20, 40, (4, 1), stride=4),
             nn.ReLU(),
             nn.Flatten(),
             nn.Dropout(dropout)
@@ -109,17 +166,17 @@ class QNet(nn.Module):
 
     def forward(self, x):
         x = torch.tensor(x, dtype=torch.float32)
-        if x.dim() == 3:
+        if x.dim() == 2:
             x = x.unsqueeze(0)
-        batch_size = x.size(0)
+
         extracted_tensors = []
-        for i in range(x.size(1)):
-            extracted_tensor = x[:, i:i + 1, :, :]
+        for i in range(10):
+            extracted_tensor = x[:, :, i * 2:i * 2 + 2]
             extracted_tensors.append(extracted_tensor)
 
-        conv_cols = [self.column_net(col) for col in extracted_tensors]
-        conv_concat = torch.cat(conv_cols, dim=0)
-        x_out = conv_concat.view(batch_size, 3200)
+        cols = [(col.unsqueeze(1)) for col in extracted_tensors]
+        conv_cols = [self.column_net(col) for col in cols]
+        x_out = torch.cat(conv_cols, dim=1)
         return self.out_net(x_out)
 
 
@@ -129,6 +186,7 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
 
 
 def generate_experience(observation, global_step):
+    # determine action
     epsilon = linear_schedule(start_e, end_e, exploration_fraction * total_timesteps, global_step)
     if random.random() < epsilon:
         action = env.action_space.sample()
@@ -136,10 +194,13 @@ def generate_experience(observation, global_step):
         q_values = q_network(torch.Tensor(observation).to(device))
         action = torch.argmax(q_values, dim=1).cpu().numpy()[0]
 
-    next_observation, reward, terminated, truncated, info = env.step(action)
+    # get new observation & reward
+    next_observation, game_reward, terminated, truncated, info = env.step(action)
+    reward, fitness = reward_fitness_func(next_observation, game_reward, global_reward.fitness)
     done = terminated or truncated
     rb.add(observation, next_observation, action, reward, done, [info])
     global_reward.add(reward)
+    global_reward.update_fitness(fitness)
 
     if done:
         writer.add_scalar("charts/episode_length", info["episode_frame_number"], global_step)
@@ -148,7 +209,7 @@ def generate_experience(observation, global_step):
         global_reward.reset()
         next_observation, reward, terminated, truncated, info = env.step(action)
 
-    return next_observation, reward, terminated, truncated, info, action
+    return next_observation
 
 
 def train_loop(update_target_network=False, global_step=0):
@@ -170,9 +231,9 @@ def train_loop(update_target_network=False, global_step=0):
 
 def train(start_step=0, end_step=total_timesteps):
     observation, *_ = env.reset()
-    observation = torch.tensor(observation, dtype=torch.float32).unsqueeze(0)
+
     for global_step in tqdm(range(start_step, end_step)):
-        observation, reward, terminated, truncated, info, action = generate_experience(observation, global_step)
+        observation = generate_experience(observation, global_step)
         if global_step > learning_starts:
             if global_step % train_frequency == 0:
                 if global_step % target_network_frequency == 0:
@@ -181,23 +242,22 @@ def train(start_step=0, end_step=total_timesteps):
                     train_loop(update_target_network=False, global_step=global_step)
 
 
-def watch_agent(env, q_network, out_directory, fps=15):
+def watch_agent(env, q_network, out_directory, fps=20):
     observation, *_ = env.reset()
     global_reward.reset()
-    observation = torch.tensor(observation, dtype=torch.float32).unsqueeze(0)
     images = []
     done = False
+
     while not done:
         img = env.render()
         images.append(img)
 
-        if random.random() < end_e:
-            action = env.action_space.sample()
-        else:
-            q_values = q_network(torch.Tensor(observation).to(device))
-            action = torch.argmax(q_values, dim=1).cpu().numpy()[0]
+        q_values = q_network(torch.Tensor(observation).to(device))
+        action = torch.argmax(q_values, dim=1).cpu().numpy()[0]
+        observation, reward, terminated, truncated, info = env.step(action)
 
-        next_observation, reward, terminated, truncated, info = env.step(action)
+        reward, fitness = reward_fitness_func(observation, reward, global_reward.fitness)
+        global_reward.update_fitness(fitness)
         global_reward.add(reward)
         done = terminated or truncated
 
@@ -218,61 +278,106 @@ if __name__ == "__main__":
 
     rb = ReplayBuffer(
         buffer_size,
-        Box(low=0, high=255, shape=(10, 2, 70), dtype=np.uint8),
+        Box(low=0, high=1, shape=(70, 20), dtype=np.uint8),
         env.action_space,
         device
     )
 
-    global_reward = GlobalReward()
+    global_reward = GlobalRewardTracker()
     train()
 
     watch_agent(env, q_network, "../tetris.mp4")
 
-    model_path = f"../tetris/{'tetris'}.model"
+    model_path = f"../tetris/{'tetris_v2'}.model"
     torch.save(q_network.state_dict(), model_path)
     print(f"model saved to {model_path}")
 
-
-q_network.load_state_dict(torch.load(model_path))
-
+    q_network.load_state_dict(torch.load(model_path))
 
 
 
 
 
-
-
-
-
-
-
-x_start = 13
-x_stop = 33
-y_start = 11
-y_stop = 81
-
-img = np.ndarray([y_stop - y_start, x_stop - x_start])
-
-for i in range(y_start, y_stop):
-    row = observation[i][x_start:x_stop]
-    img[i-y_start] = row
-
-
+##########
 from PIL import Image
 import numpy as np
 image_RGB = img
 image = Image.fromarray(image_RGB.astype('uint8'))
 image.save('../image.jpg')
 
-q_network.pixel_net(torch.tensor(img[0], dtype=torch.float32))
-
-q_network = Net()
-
-a = torch.tensor(img[0], dtype=torch.float32).unsqueeze(-1).T
-a = a.unsqueeze(1)
-
-b = q_network.pixel_net(a)
-
+img = env.render()
 imageio.mimsave("../tetris.png", [np.array(img) for i in img])
 
-reshaped_array = x_T.reshape(10, 2, 70)
+
+x_start = 13
+x_stop = 33
+y_start = 11
+y_stop = 81
+img = np.ndarray([y_stop - y_start, x_stop - x_start])
+
+for i in range(y_start, y_stop):
+    row = observation[i][x_start:x_stop]
+    img[i-y_start] = row
+
+condensed_frame = img.reshape(10, 2, 70)
+reshape = condensed_frame.reshape(20, 70)
+
+from PIL import Image
+import numpy as np
+image_RGB = t
+image = Image.fromarray(image_RGB.astype('uint8'))
+image.save('../image.jpg')
+
+
+env = create_env()
+env.reset()
+observation, *_ = env.step(0)
+obs = observation
+
+x = observation
+x = torch.tensor(x, dtype=torch.float32).unsqueeze(0)
+
+extracted_tensors = []
+for i in range(10):
+    extracted_tensor = x[:,:, i*2:i*2+2]
+    extracted_tensors.append(extracted_tensor)
+
+
+n = QNet(env)
+cols = [(col.unsqueeze(1)) for col in extracted_tensors]
+conv_cols = [n.column_net(col.unsqueeze(1)) for col in extracted_tensors]
+
+
+class Net(nn.Module):
+    """Experiment with a more complex architecture + dropout"""
+    def __init__(self):
+        super().__init__()
+        self.column_net = nn.Sequential(
+            nn.Conv2d(1, 20, 2, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(20, 40, (4, 1), stride=4),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Dropout(dropout)
+        )
+
+n = Net()
+
+v_2 = torch.cat([cols[0], cols[3]], dim=0)
+conv = n.column_net(v_2)
+
+
+env = create_env()
+obs, *_ = env.reset()
+
+obs = (obs * 255).astype(int)
+arr = obs
+arr[arr == 111] = 0
+arr[arr != 0] = 1
+
+t = torch.tensor(obs)
+t = t.masked_fill(t == 111, 0)
+t = t.masked_fill(t != 0, 1)
+
+import pandas as pd
+df = pd.DataFrame(t)
