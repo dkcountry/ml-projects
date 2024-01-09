@@ -24,14 +24,14 @@ SEED = 42069
 device = torch.device("mps")
 learning_rate = 1e-4
 batch_size = 32
-start_e = .25
+start_e = 1.
 end_e = .01
 exploration_fraction = 0.1
 tau = 1.0
 gamma = .99
-buffer_size = 5000
-total_timesteps = 100000
-learning_starts = 5000
+buffer_size = 50000
+total_timesteps = 1500000
+learning_starts = 100000
 target_network_frequency = 100
 train_frequency = 4
 dropout = 0.2
@@ -61,7 +61,7 @@ class CondenseFrame(gym.ObservationWrapper):
             return condensed_frame
 
 
-def create_env(env_id="ALE/Tetris-v5", record_video=False):
+def create_env(env_id="ALE/Tetris-v5", record_video=True):
     env = gym.make(env_id, render_mode="rgb_array")
     env = NoopResetEnv(env, noop_max=10)
     env = MaxAndSkipEnv(env, skip=3)
@@ -205,7 +205,8 @@ def generate_experience(observation, global_step):
     global_reward.update_fitness(fitness)
 
     # add to replay buffer
-    rb.add(observation, next_observation, action, reward, done, [info])
+    if (reward != 0) or (random.random() < .25):
+        rb.add(observation, next_observation, action, reward, done, [info])
 
     if done:
         writer.add_scalar("charts/episode_length", info["episode_frame_number"], global_step)
