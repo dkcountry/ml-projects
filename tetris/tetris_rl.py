@@ -29,9 +29,9 @@ end_e = .01
 exploration_fraction = 0.1
 tau = 1.0
 gamma = .99
-buffer_size = 50000
+buffer_size = 80000
 total_timesteps = 1500000
-learning_starts = 100000
+learning_starts = 30000
 target_network_frequency = 100
 train_frequency = 4
 dropout = 0.2
@@ -61,12 +61,12 @@ class CondenseFrame(gym.ObservationWrapper):
             return condensed_frame
 
 
-def create_env(env_id="ALE/Tetris-v5", record_video=True):
+def create_env(env_id="ALE/Tetris-v5", record_video=False):
     env = gym.make(env_id, render_mode="rgb_array")
     env = NoopResetEnv(env, noop_max=10)
     env = MaxAndSkipEnv(env, skip=3)
     env = EpisodicLifeEnv(env)
-    env = ClipRewardEnv(env)
+    # env = ClipRewardEnv(env)
     env = gym.wrappers.ResizeObservation(env, (84, 84))
     env = gym.wrappers.GrayScaleObservation(env)
     env = ScaledBoolFrame(env)
@@ -109,7 +109,7 @@ def censor_moving_piece(obs_new, obs_old):
     return obs_out
 
 
-def reward_fitness_func(obs_new, obs_old, game_reward, prev_fitness, done=False):
+def reward_fitness_func(obs_new, obs_old, game_reward, prev_fitness, done=False, max_grid_reward=.15):
     if done:
         return -1.0, prev_fitness - 1.0
 
@@ -117,8 +117,11 @@ def reward_fitness_func(obs_new, obs_old, game_reward, prev_fitness, done=False)
         return game_reward, prev_fitness
 
     aggregate_height, bumpiness = board_stats(obs_new, obs_old)
+    curr_fitness = -aggregate_height / 3600 - bumpiness / 1200
+    reward = curr_fitness - prev_fitness
 
-    curr_fitness = -aggregate_height / 1400 - bumpiness / 1200
+    if reward > max_grid_reward:
+        return max_grid_reward, prev_fitness + max_grid_reward
     return curr_fitness - prev_fitness, curr_fitness
 
 
@@ -185,7 +188,7 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     return max(slope * t + start_e, end_e)
 
 
-def generate_experience(observation, global_step):
+def generate_experience(observation, global_step, save_positive_only=False):
     # determine action
     epsilon = linear_schedule(start_e, end_e, exploration_fraction * total_timesteps, global_step)
     if random.random() < epsilon:
@@ -204,8 +207,10 @@ def generate_experience(observation, global_step):
     global_reward.add(reward)
     global_reward.update_fitness(fitness)
 
-    # add to replay buffer
-    if (reward != 0) or (random.random() < .25):
+    # conditionally save to replay buffer
+    if save_positive_only and reward > 0:
+        rb.add(observation, next_observation, action, reward, done, [info])
+    elif (not save_positive_only) and ((reward != 0) or (random.random() < .10)):
         rb.add(observation, next_observation, action, reward, done, [info])
 
     if done:
@@ -246,6 +251,12 @@ def train(start_step=0, end_step=total_timesteps):
                     weight_train_loop(update_target_network=True, global_step=global_step)
                 else:
                     weight_train_loop(update_target_network=False, global_step=global_step)
+
+
+def seed_positive_experiences(total_steps):
+    observation, *_ = env.reset()
+    for step in tqdm(range(total_steps)):
+        observation = generate_experience(observation, step, save_positive_only=True)
 
 
 def watch_agent(q_network, out_directory, fps=20):
@@ -290,6 +301,7 @@ if __name__ == "__main__":
     optimizer = optim.Adam(q_network.parameters(), lr=learning_rate)
     target_network = QNet(env).to(device)
     target_network.load_state_dict(q_network.state_dict())
+    global_reward = GlobalRewardTracker()
 
     rb = ReplayBuffer(
         buffer_size,
@@ -297,8 +309,9 @@ if __name__ == "__main__":
         env.action_space,
         device
     )
+    seed_positive_experiences(100000)
 
-    global_reward = GlobalRewardTracker()
+    env = create_env(record_video=True)
     train()
 
     watch_agent(q_network, "../tetris.mp4")
@@ -308,3 +321,13 @@ if __name__ == "__main__":
     print(f"model saved to {model_path}")
 
     q_network.load_state_dict(torch.load(model_path))
+
+
+####
+# obs_new = np.copy(o[0][2])
+# obs_old = np.copy(o[0][1])
+#
+# censored = censor_moving_piece(obs_new, obs_old)
+# img = censored * 255.
+# image = Image.fromarray(img.astype('uint8'))
+# image.save(f'../image_censored.jpg')
